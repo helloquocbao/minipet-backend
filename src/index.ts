@@ -17,14 +17,78 @@ const NETWORK = (process.env.SUI_NETWORK as 'testnet' | 'mainnet' | 'devnet') ||
 const client = new SuiClient({ url: getFullnodeUrl(NETWORK), network: NETWORK });
 
 // Initialize Admin Keypair
-const adminKeypair = Ed25519Keypair.fromSecretKey(
-  Buffer.from(process.env.ADMIN_SECRET_KEY || '', 'base64')
-);
+const secretKeyStr = process.env.ADMIN_SECRET_KEY || '';
+const adminKeypair = secretKeyStr.startsWith('suiprivkey1')
+  ? Ed25519Keypair.fromSecretKey(secretKeyStr)
+  : Ed25519Keypair.fromSecretKey(Buffer.from(secretKeyStr, 'base64'));
 
 const PACKAGE_ID = process.env.PACKAGE_ID;
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', network: NETWORK, admin: adminKeypair.getPublicKey().toSuiAddress() });
+});
+
+/**
+ * Endpoint to securely upload file to Walrus and auto-transfer ownership to the user/admin
+ */
+app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res) => {
+  try {
+    const { targetAddress, isCustom } = req.query;
+
+    if (!targetAddress || typeof targetAddress !== 'string') {
+      return res.status(400).json({ error: 'Missing or invalid targetAddress parameter' });
+    }
+
+    const isCustomBool = isCustom === 'true';
+
+    // 1. SECURITY CHECKS
+    if (isCustomBool) {
+      // Custom Pet Flow: Verify user owns a MintSlot on-chain
+      const objects = await client.getOwnedObjects({
+        owner: targetAddress,
+        filter: { StructType: `${PACKAGE_ID}::pet_nft::MintSlot` }
+      });
+
+      if (objects.data.length === 0) {
+        return res.status(403).json({ error: 'User does not own a MintSlot. Upload denied.' });
+      }
+      console.log(`[Upload] User ${targetAddress} verified with active MintSlot.`);
+    } else {
+      // Admin Flow: Verify targetAddress is the Admin address
+      const adminAddress = adminKeypair.getPublicKey().toSuiAddress();
+      if (targetAddress.toLowerCase() !== adminAddress.toLowerCase()) {
+        return res.status(403).json({ error: 'Only admin can perform admin uploads.' });
+      }
+      console.log(`[Upload] Admin ${targetAddress} verified.`);
+    }
+
+    // 2. UPLOAD TO WALRUS & TRANSFER OWNERSHIP ON-CHAIN (using send_object_to)
+    const epochs = 5;
+    const publisherUrl = process.env.WALRUS_PUBLISHER_URL || process.env.VITE_WALRUS_PUBLISHER_URL || 'https://publisher.walrus-testnet.walrus.space';
+    const walrusUrl = `${publisherUrl}/v1/blobs?epochs=${epochs}&send_object_to=${targetAddress}`;
+
+    console.log(`[Upload] Requesting Walrus storage & transfer to ${targetAddress}...`);
+
+    const response = await fetch(walrusUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': req.headers['content-type'] || 'application/octet-stream',
+      },
+      body: req.body,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return res.status(500).json({ error: `Walrus upload failed: ${errorText}` });
+    }
+
+    const data = await response.json();
+    console.log(`[Upload] Successfully uploaded and transferred to ${targetAddress}. Response:`, JSON.stringify(data));
+    res.json(data);
+  } catch (error) {
+    console.error('Upload handling error:', error);
+    res.status(500).json({ error: 'Internal server error during upload' });
+  }
 });
 
 /**
