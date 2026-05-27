@@ -8,6 +8,16 @@ import { Transaction } from '@mysten/sui/transactions';
 
 dotenv.config();
 
+// 1. STARTUP VALIDATION CHECKS
+if (!process.env.ADMIN_SECRET_KEY) {
+  console.error("❌ ADMIN_SECRET_KEY is missing from environment variables!");
+  process.exit(1);
+}
+if (!process.env.PACKAGE_ID) {
+  console.error("❌ PACKAGE_ID is missing from environment variables!");
+  process.exit(1);
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -17,12 +27,21 @@ const NETWORK = (process.env.SUI_NETWORK as 'testnet' | 'mainnet' | 'devnet') ||
 const client = new SuiClient({ url: getFullnodeUrl(NETWORK), network: NETWORK });
 
 // Initialize Admin Keypair
-const secretKeyStr = process.env.ADMIN_SECRET_KEY || '';
+const secretKeyStr = process.env.ADMIN_SECRET_KEY;
 const adminKeypair = secretKeyStr.startsWith('suiprivkey1')
   ? Ed25519Keypair.fromSecretKey(secretKeyStr)
   : Ed25519Keypair.fromSecretKey(Buffer.from(secretKeyStr, 'base64'));
 
 const PACKAGE_ID = process.env.PACKAGE_ID;
+const SUI_ADDRESS_REGEX = /^0x[a-fA-F0-9]{1,64}$/;
+
+function normalizeSuiAddress(addr: string): string {
+  let clean = addr.toLowerCase().trim();
+  if (clean.startsWith('0x')) {
+    clean = clean.substring(2);
+  }
+  return '0x' + clean.padStart(64, '0');
+}
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', network: NETWORK, admin: adminKeypair.getPublicKey().toSuiAddress() });
@@ -35,8 +54,13 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
   try {
     const { targetAddress, isCustom } = req.query;
 
-    if (!targetAddress || typeof targetAddress !== 'string') {
-      return res.status(400).json({ error: 'Missing or invalid targetAddress parameter' });
+    if (!targetAddress || typeof targetAddress !== 'string' || !SUI_ADDRESS_REGEX.test(targetAddress)) {
+      return res.status(400).json({ error: 'Missing or invalid targetAddress parameter (must be 0x...)' });
+    }
+
+    // Verify raw request body presence and length
+    if (!req.body || req.body.length === 0) {
+      return res.status(400).json({ error: 'Empty payload provided for upload' });
     }
 
     const isCustomBool = isCustom === 'true';
@@ -65,7 +89,7 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
     // 2. UPLOAD TO WALRUS & TRANSFER OWNERSHIP ON-CHAIN (using send_object_to)
     const epochs = 5;
     const publisherUrl = process.env.WALRUS_PUBLISHER_URL || process.env.VITE_WALRUS_PUBLISHER_URL || 'https://publisher.walrus-testnet.walrus.space';
-    const walrusUrl = `${publisherUrl}/v1/blobs?epochs=${epochs}&send_object_to=${targetAddress}`;
+    const walrusUrl = `${publisherUrl}/v1/blobs?epochs=${epochs}&send_object_to=${encodeURIComponent(targetAddress)}`;
 
     console.log(`[Upload] Requesting Walrus storage & transfer to ${targetAddress}...`);
 
@@ -98,8 +122,8 @@ app.post('/sponsor', async (req, res) => {
   try {
     const { txBytes, userAddress } = req.body;
 
-    if (!txBytes || !userAddress) {
-      return res.status(400).json({ error: 'Missing txBytes or userAddress' });
+    if (!txBytes || !userAddress || typeof userAddress !== 'string' || !SUI_ADDRESS_REGEX.test(userAddress)) {
+      return res.status(400).json({ error: 'Missing or invalid txBytes or userAddress' });
     }
 
     // 1. SECURITY CHECK: Verify user has a Mint Slot on-chain
@@ -115,20 +139,37 @@ app.post('/sponsor', async (req, res) => {
     // 2. RECONSTRUCT TRANSACTION
     const tx = Transaction.from(txBytes);
 
-    // 3. SET GAS SPONSOR
-    // Admin pays for gas (which includes the Walrus storage fee if it's part of the PTB)
+    // 3. TRANSACTION INSPECTION & SPONSORSHIP POLICIES
+    // A. Limit Gas budget (Max 100,000,000 MIST = 0.1 SUI) to prevent draining
+    const gasBudget = tx.getData().gasData.budget;
+    if (gasBudget && Number(gasBudget) > 100_000_000) {
+      return res.status(403).json({ error: 'Sponsorship denied: Transaction gas budget is too high (max 0.1 SUI).' });
+    }
+
+    // B. Verify transaction calls only target our authorized package
+    const normalizedPackageId = normalizeSuiAddress(PACKAGE_ID);
+    for (const command of tx.getData().commands) {
+      if (command.$kind === 'MoveCall') {
+        const cmdPackage = command.MoveCall.package;
+        if (normalizeSuiAddress(cmdPackage) !== normalizedPackageId) {
+          console.warn(`[Sponsor Abuse Blocked] User ${userAddress} attempted to sponsor call to unauthorized package: ${cmdPackage}`);
+          return res.status(403).json({ error: 'Sponsorship denied: Transaction calls unauthorized packages.' });
+        }
+      }
+    }
+
+    // 4. SET GAS SPONSOR
     tx.setGasOwner(adminKeypair.getPublicKey().toSuiAddress());
     
-    // 4. SIGN AS SPONSOR
+    // 5. SIGN AS SPONSOR
     const { signature } = await tx.sign({
         client,
         signer: adminKeypair,
     });
 
-    // 5. RETURN SPONSORED DATA
+    // 6. RETURN SPONSORED DATA
     res.json({
       signature,
-      // The frontend will now combine this with its own signature and execute
     });
 
     console.log(`Successfully sponsored transaction for ${userAddress}`);
