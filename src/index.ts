@@ -5,6 +5,7 @@ import { Buffer } from 'buffer';
 import { getJsonRpcFullnodeUrl as getFullnodeUrl, SuiJsonRpcClient as SuiClient } from '@mysten/sui/jsonRpc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction } from '@mysten/sui/transactions';
+import { jwtToAddress } from '@mysten/sui/zklogin';
 
 dotenv.config();
 
@@ -15,6 +16,14 @@ if (!process.env.ADMIN_SECRET_KEY) {
 }
 if (!process.env.PACKAGE_ID) {
   console.error("❌ PACKAGE_ID is missing from environment variables!");
+  process.exit(1);
+}
+if (!process.env.ZKLOGIN_SALT) {
+  console.error("❌ ZKLOGIN_SALT is missing from environment variables!");
+  process.exit(1);
+}
+if (!process.env.GOOGLE_CLIENT_ID) {
+  console.error("❌ GOOGLE_CLIENT_ID is missing from environment variables!");
   process.exit(1);
 }
 
@@ -48,7 +57,43 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * Endpoint to securely upload file to Walrus and auto-transfer ownership to the user/admin
+ * Endpoint to securely derive a zkLogin address using backend-only Salt (SEC-04)
+ */
+app.post('/derive-address', async (req, res) => {
+  try {
+    const { jwt } = req.body;
+    if (!jwt || typeof jwt !== 'string') {
+      return res.status(400).json({ error: 'Missing or invalid jwt payload' });
+    }
+
+    const parts = jwt.split('.');
+    if (parts.length !== 3) {
+      return res.status(400).json({ error: 'Invalid JWT structure' });
+    }
+
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf-8'));
+    
+    // Validate JWT claims
+    if (payload.aud !== process.env.GOOGLE_CLIENT_ID) {
+      return res.status(400).json({ error: 'Invalid JWT audience' });
+    }
+    if (payload.iss !== 'https://accounts.google.com' && payload.iss !== 'accounts.google.com') {
+      return res.status(400).json({ error: 'Invalid JWT issuer' });
+    }
+    if (payload.exp < Date.now() / 1000) {
+      return res.status(400).json({ error: 'JWT has expired' });
+    }
+
+    const address = jwtToAddress(jwt, BigInt(process.env.ZKLOGIN_SALT!), false);
+    res.json({ address });
+  } catch (error: any) {
+    console.error('Derive address error:', error);
+    res.status(500).json({ error: error.message || 'Failed to derive address' });
+  }
+});
+
+/**
+ * Endpoint to securely upload file to Walrus and auto-transfer ownership to the user/admin (SEC-05)
  */
 app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res) => {
   try {
@@ -65,7 +110,52 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
 
     const isCustomBool = isCustom === 'true';
 
-    // 1. SECURITY CHECKS
+    // 1. SECURITY CHECKS (SEC-05: Authenticate targetAddress ownership)
+    const authHeader = req.headers['authorization'];
+    const signatureHeader = req.headers['x-sui-signature'];
+    let isAuthorized = false;
+
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      // zkLogin verification via JWT
+      const jwt = authHeader.substring(7);
+      try {
+        const parts = jwt.split('.');
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf-8'));
+        if (
+          payload.aud === process.env.GOOGLE_CLIENT_ID &&
+          (payload.iss === 'https://accounts.google.com' || payload.iss === 'accounts.google.com') &&
+          payload.exp > Date.now() / 1000
+        ) {
+          const derivedAddress = jwtToAddress(jwt, BigInt(process.env.ZKLOGIN_SALT!), false);
+
+          if (normalizeSuiAddress(derivedAddress) === normalizeSuiAddress(targetAddress)) {
+            isAuthorized = true;
+          }
+        }
+      } catch (jwtErr) {
+        console.error('[Upload Auth] JWT check failed:', jwtErr);
+      }
+    } else if (signatureHeader && typeof signatureHeader === 'string') {
+      // Standard signature verification for Extension Wallet
+      try {
+        const message = `MiniPet Upload: ${targetAddress}`;
+        const messageBytes = new TextEncoder().encode(message);
+        const { verifyPersonalMessageSignature } = await import('@mysten/sui/verify');
+        const publicKey = await verifyPersonalMessageSignature(messageBytes, signatureHeader, {
+          address: targetAddress
+        });
+        if (publicKey) {
+          isAuthorized = true;
+        }
+      } catch (sigErr) {
+        console.error('[Upload Auth] Signature check failed:', sigErr);
+      }
+    }
+
+    if (!isAuthorized) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid credentials or signature for targetAddress' });
+    }
+
     if (isCustomBool) {
       // Custom Pet Flow: Verify user owns a MintSlot on-chain
       const objects = await client.getOwnedObjects({
@@ -116,7 +206,7 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
 });
 
 /**
- * Endpoint to sponsor a transaction (Gas & Walrus fees)
+ * Endpoint to sponsor a transaction (Gas & Walrus fees) (SEC-02)
  */
 app.post('/sponsor', async (req, res) => {
   try {
@@ -126,7 +216,15 @@ app.post('/sponsor', async (req, res) => {
       return res.status(400).json({ error: 'Missing or invalid txBytes or userAddress' });
     }
 
-    // 1. SECURITY CHECK: Verify user has a Mint Slot on-chain
+    // 1. RECONSTRUCT TRANSACTION & SECURITY CHECK: Validate Sender (SEC-02)
+    const tx = Transaction.from(txBytes);
+    const txSender = tx.getData().sender;
+    if (!txSender || normalizeSuiAddress(txSender) !== normalizeSuiAddress(userAddress)) {
+      console.warn(`[Sponsor Abuse Blocked] Mismatched sender: txSender ${txSender} vs userAddress ${userAddress}`);
+      return res.status(403).json({ error: 'Sponsorship denied: Transaction sender must match userAddress.' });
+    }
+
+    // 2. SECURITY CHECK: Verify user has a Mint Slot on-chain
     const objects = await client.getOwnedObjects({
       owner: userAddress,
       filter: { StructType: `${PACKAGE_ID}::pet_nft::MintSlot` }
@@ -135,9 +233,6 @@ app.post('/sponsor', async (req, res) => {
     if (objects.data.length === 0) {
       return res.status(403).json({ error: 'User does not own a MintSlot. Sponsorship denied.' });
     }
-
-    // 2. RECONSTRUCT TRANSACTION
-    const tx = Transaction.from(txBytes);
 
     // 3. TRANSACTION INSPECTION & SPONSORSHIP POLICIES
     // A. Limit Gas budget (Max 100,000,000 MIST = 0.1 SUI) to prevent draining
