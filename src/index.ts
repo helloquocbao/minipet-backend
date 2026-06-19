@@ -346,30 +346,34 @@ app.post('/faucet', async (req, res) => {
       return res.status(400).json({ error: 'Missing or invalid recipient address' });
     }
 
-    console.log(`[Faucet] Minting MIPET tokens to ${recipient}...`);
+    const FAUCET_AMOUNT = 10000_000000000n; // 10,000 MIPET
+    const PET_TOKEN_TYPE = `${process.env.PET_TOKEN_PACKAGE_ID || '0x46af6cc67f8a40f6a4a5267087176e6e4341e51df6e9decabfe07cf606186e23'}::pet_token::PET_TOKEN`;
+
+    console.log(`[Faucet] Transferring MIPET tokens to ${recipient}...`);
 
     const tx = new Transaction();
-    tx.moveCall({
-      target: `${process.env.PET_TOKEN_PACKAGE_ID || '0x34564fd6bf0afdd7cbd6d2f2943de413df645ffa703417948638ea1d10c710d8'}::pet_token::mint`,
-      arguments: [
-        tx.object(process.env.TREASURY_CAP_ID || '0xee70cb5c91f06d64d2e136378008550b47fa29dc6057ed9538e97641bbdbe629'),
-        tx.pure.u64(10000_000000000n), // 10,000 MIPET (9 decimals)
-        tx.pure.address(recipient)
-      ]
-    });
+    tx.setSender(adminKeypair.getPublicKey().toSuiAddress());
+
+    // Get admin's MIPET coins
+    const coins = await client.getCoins({ owner: adminKeypair.getPublicKey().toSuiAddress(), coinType: PET_TOKEN_TYPE });
+    if (!coins.data.length) {
+      return res.status(500).json({ error: 'Admin wallet has no MIPET tokens' });
+    }
+
+    const [coin] = tx.splitCoins(tx.object(coins.data[0].coinObjectId), [FAUCET_AMOUNT]);
+    tx.transferObjects([coin], recipient);
 
     const result = await client.signAndExecuteTransaction({
       signer: adminKeypair,
       transaction: tx,
     });
 
-    // Wait for transaction to succeed
     await client.waitForTransaction({ digest: result.digest });
 
-    console.log(`[Faucet] Successfully minted to ${recipient}. Tx: ${result.digest}`);
+    console.log(`[Faucet] Successfully transferred to ${recipient}. Tx: ${result.digest}`);
     res.json({ success: true, digest: result.digest });
   } catch (error: any) {
-    console.error('[Faucet] Error minting token:', error);
+    console.error('[Faucet] Error:', error);
     res.status(500).json({ error: error.message || 'Faucet request failed' });
   }
 });
