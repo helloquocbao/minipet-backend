@@ -141,11 +141,19 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
         const message = `MiniPet Upload: ${targetAddress}`;
         const messageBytes = new TextEncoder().encode(message);
         const { verifyPersonalMessageSignature } = await import('@mysten/sui/verify');
+        
+        // Verify the signature is valid for the message and extract public key
         const publicKey = await verifyPersonalMessageSignature(messageBytes, signatureHeader, {
-          address: targetAddress
+          client: client
         });
-        if (publicKey) {
+        const derivedAddress = publicKey.toSuiAddress();
+        
+        console.log(`[Upload Auth] verify signature: derivedAddress=${derivedAddress}, targetAddress=${targetAddress}`);
+        
+        if (normalizeSuiAddress(derivedAddress) === normalizeSuiAddress(targetAddress)) {
           isAuthorized = true;
+        } else {
+          console.warn(`[Upload Auth] Mismatch: derived ${normalizeSuiAddress(derivedAddress)} vs target ${normalizeSuiAddress(targetAddress)}`);
         }
       } catch (sigErr) {
         console.error('[Upload Auth] Signature check failed:', sigErr);
@@ -177,7 +185,7 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
     }
 
     // 2. UPLOAD TO WALRUS & TRANSFER OWNERSHIP ON-CHAIN (using send_object_to)
-    const epochs = 5;
+    const epochs = 40;
     const publisherUrl = process.env.WALRUS_PUBLISHER_URL || process.env.VITE_WALRUS_PUBLISHER_URL || 'https://publisher.walrus-testnet.walrus.space';
     const walrusUrl = `${publisherUrl}/v1/blobs?epochs=${epochs}&send_object_to=${encodeURIComponent(targetAddress)}`;
 
@@ -210,9 +218,11 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
  */
 app.post('/sponsor', async (req, res) => {
   try {
-    const { txBytes, userAddress } = req.body;
+    console.log('[Backend Sponsor] Received req.body:', JSON.stringify(req.body));
+    const { txBytes, userAddress, userSignature } = req.body;
 
     if (!txBytes || !userAddress || typeof userAddress !== 'string' || !SUI_ADDRESS_REGEX.test(userAddress)) {
+      console.warn('[Backend Sponsor] Validation failed. txBytes length:', txBytes ? txBytes.length : 0, 'userAddress:', userAddress);
       return res.status(400).json({ error: 'Missing or invalid txBytes or userAddress' });
     }
 
@@ -224,53 +234,143 @@ app.post('/sponsor', async (req, res) => {
       return res.status(403).json({ error: 'Sponsorship denied: Transaction sender must match userAddress.' });
     }
 
-    // 2. SECURITY CHECK: Verify user has a Mint Slot on-chain
-    const objects = await client.getOwnedObjects({
-      owner: userAddress,
-      filter: { StructType: `${PACKAGE_ID}::pet_nft::MintSlot` }
-    });
+    // 2. TRANSACTION INSPECTION & SPONSORSHIP POLICIES
+    let bypassMintSlotCheck = false;
+    const normalizedPackageId = normalizeSuiAddress(PACKAGE_ID);
+    for (const command of tx.getData().commands) {
+      if (command.$kind === 'MoveCall') {
+        const cmdPackage = command.MoveCall.package;
+        const cmdModule = command.MoveCall.module;
+        const cmdFunction = command.MoveCall.function;
 
-    if (objects.data.length === 0) {
-      return res.status(403).json({ error: 'User does not own a MintSlot. Sponsorship denied.' });
+        if (normalizeSuiAddress(cmdPackage) !== normalizedPackageId) {
+          console.warn(`[Sponsor Abuse Blocked] User ${userAddress} attempted to sponsor call to unauthorized package: ${cmdPackage}`);
+          return res.status(403).json({ error: 'Sponsorship denied: Transaction calls unauthorized packages.' });
+        }
+
+        if (cmdModule === 'pet_nft' && (cmdFunction === 'buy_mint_slot' || cmdFunction === 'buy_pet')) {
+          bypassMintSlotCheck = true;
+        }
+      }
     }
 
-    // 3. TRANSACTION INSPECTION & SPONSORSHIP POLICIES
     // A. Limit Gas budget (Max 100,000,000 MIST = 0.1 SUI) to prevent draining
     const gasBudget = tx.getData().gasData.budget;
     if (gasBudget && Number(gasBudget) > 100_000_000) {
       return res.status(403).json({ error: 'Sponsorship denied: Transaction gas budget is too high (max 0.1 SUI).' });
     }
 
-    // B. Verify transaction calls only target our authorized package
-    const normalizedPackageId = normalizeSuiAddress(PACKAGE_ID);
-    for (const command of tx.getData().commands) {
-      if (command.$kind === 'MoveCall') {
-        const cmdPackage = command.MoveCall.package;
-        if (normalizeSuiAddress(cmdPackage) !== normalizedPackageId) {
-          console.warn(`[Sponsor Abuse Blocked] User ${userAddress} attempted to sponsor call to unauthorized package: ${cmdPackage}`);
-          return res.status(403).json({ error: 'Sponsorship denied: Transaction calls unauthorized packages.' });
-        }
+    // 3. SECURITY CHECK: Verify user has a Mint Slot on-chain (Unless they are buying a slot or pet)
+    if (!bypassMintSlotCheck) {
+      const objects = await client.getOwnedObjects({
+        owner: userAddress,
+        filter: { StructType: `${PACKAGE_ID}::pet_nft::MintSlot` }
+      });
+
+      if (objects.data.length === 0) {
+        return res.status(403).json({ error: 'User does not own a MintSlot. Sponsorship denied.' });
       }
     }
 
-    // 4. SET GAS SPONSOR
-    tx.setGasOwner(adminKeypair.getPublicKey().toSuiAddress());
-    
-    // 5. SIGN AS SPONSOR
-    const { signature } = await tx.sign({
-        client,
-        signer: adminKeypair,
-    });
+    // 4. SIGN AS SPONSOR
+    const rawTxBytes = Buffer.from(txBytes, 'base64');
+    const { signature: sponsorSignature } = await adminKeypair.signTransaction(rawTxBytes);
 
-    // 6. RETURN SPONSORED DATA
+    // 5. COMBINE SIGNATURES & EXECUTE ON-CHAIN (If userSignature is provided)
+    if (userSignature) {
+      console.log(`[Sponsor] Executing sponsored transaction for ${userAddress} directly...`);
+      const result = await client.executeTransactionBlock({
+        transactionBlock: rawTxBytes,
+        signature: [userSignature, sponsorSignature],
+        options: { showEffects: true, showEvents: true }
+      });
+      console.log(`Successfully executed sponsored transaction for ${userAddress}. Digest: ${result.digest}`);
+      return res.json({
+        success: true,
+        digest: result.digest,
+      });
+    }
+
+    // Fallback: If userSignature is not provided yet, just return the sponsor signature
     res.json({
-      signature,
+      signature: sponsorSignature,
+    });
+  } catch (error: any) {
+    console.error('Sponsorship execution error:', error);
+    res.status(500).json({ error: error.message || 'Internal server error during sponsorship' });
+  }
+});
+
+/**
+ * Endpoint to request a sponsor SUI gas coin for transaction building (SEC-02)
+ */
+app.get('/sponsor-gas-coin', async (req, res) => {
+  try {
+    const adminAddress = adminKeypair.getPublicKey().toSuiAddress();
+    console.log(`[Sponsor Gas] Fetching SUI gas coins for admin ${adminAddress}...`);
+
+    const coins = await client.getCoins({
+      owner: adminAddress,
+      coinType: '0x2::sui::SUI'
     });
 
-    console.log(`Successfully sponsored transaction for ${userAddress}`);
-  } catch (error) {
-    console.error('Sponsorship error:', error);
-    res.status(500).json({ error: 'Internal server error during sponsorship' });
+    // Find a SUI coin with sufficient balance for gas budget (e.g., at least 0.1 SUI = 100,000,000 MIST)
+    const gasCoin = coins.data.find(c => BigInt(c.balance) >= 50_000_000n);
+
+    if (!gasCoin) {
+      console.error('[Sponsor Gas] Admin does not have any SUI coins with balance >= 0.05 SUI');
+      return res.status(500).json({ error: 'Admin has no suitable SUI gas coins left.' });
+    }
+
+    res.json({
+      sponsorAddress: adminAddress,
+      gasCoin: {
+        objectId: gasCoin.coinObjectId,
+        version: gasCoin.version,
+        digest: gasCoin.digest
+      }
+    });
+  } catch (error: any) {
+    console.error('[Sponsor Gas] Error fetching sponsor SUI gas coin:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch sponsor gas coin' });
+  }
+});
+
+/**
+ * Faucet endpoint for users to claim MIPET utility token on testnet
+ */
+app.post('/faucet', async (req, res) => {
+  try {
+    const { recipient } = req.body;
+    if (!recipient || typeof recipient !== 'string' || !SUI_ADDRESS_REGEX.test(recipient)) {
+      return res.status(400).json({ error: 'Missing or invalid recipient address' });
+    }
+
+    console.log(`[Faucet] Minting MIPET tokens to ${recipient}...`);
+
+    const tx = new Transaction();
+    tx.moveCall({
+      target: `${process.env.PET_TOKEN_PACKAGE_ID || '0x34564fd6bf0afdd7cbd6d2f2943de413df645ffa703417948638ea1d10c710d8'}::pet_token::mint`,
+      arguments: [
+        tx.object(process.env.TREASURY_CAP_ID || '0xee70cb5c91f06d64d2e136378008550b47fa29dc6057ed9538e97641bbdbe629'),
+        tx.pure.u64(10000_000000000n), // 10,000 MIPET (9 decimals)
+        tx.pure.address(recipient)
+      ]
+    });
+
+    const result = await client.signAndExecuteTransaction({
+      signer: adminKeypair,
+      transaction: tx,
+    });
+
+    // Wait for transaction to succeed
+    await client.waitForTransaction({ digest: result.digest });
+
+    console.log(`[Faucet] Successfully minted to ${recipient}. Tx: ${result.digest}`);
+    res.json({ success: true, digest: result.digest });
+  } catch (error: any) {
+    console.error('[Faucet] Error minting token:', error);
+    res.status(500).json({ error: error.message || 'Faucet request failed' });
   }
 });
 
