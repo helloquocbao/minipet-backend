@@ -75,19 +75,18 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
     let isAuthorized = false;
 
     if (authHeader && authHeader.startsWith('Bearer ')) {
-      // zkLogin verification via JWT
+      // zkLogin verification via Enoki
       const jwt = authHeader.substring(7);
       try {
-        const parts = jwt.split('.');
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf-8'));
-        if (
-          payload.aud === process.env.GOOGLE_CLIENT_ID &&
-          (payload.iss === 'https://accounts.google.com' || payload.iss === 'accounts.google.com') &&
-          payload.exp > Date.now() / 1000
-        ) {
-          const derivedAddress = jwtToAddress(jwt, BigInt(process.env.ZKLOGIN_SALT!), false);
-
-          if (normalizeSuiAddress(derivedAddress) === normalizeSuiAddress(targetAddress)) {
+        const enokiRes = await fetch('https://api.enoki.mystenlabs.com/v1/zklogin', {
+          headers: {
+            'Authorization': 'Bearer enoki_public_b1c00104f51636649e30132176038cd8',
+            'zklogin-jwt': jwt,
+          },
+        });
+        if (enokiRes.ok) {
+          const enokiData = (await enokiRes.json() as any).data;
+          if (normalizeSuiAddress(enokiData.address) === normalizeSuiAddress(targetAddress)) {
             isAuthorized = true;
           }
         }
