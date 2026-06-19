@@ -5,7 +5,6 @@ import { Buffer } from 'buffer';
 import { getJsonRpcFullnodeUrl as getFullnodeUrl, SuiJsonRpcClient as SuiClient } from '@mysten/sui/jsonRpc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction } from '@mysten/sui/transactions';
-import { jwtToAddress } from '@mysten/sui/zklogin';
 
 dotenv.config();
 
@@ -16,10 +15,6 @@ if (!process.env.ADMIN_SECRET_KEY) {
 }
 if (!process.env.PACKAGE_ID) {
   console.error("❌ PACKAGE_ID is missing from environment variables!");
-  process.exit(1);
-}
-if (!process.env.ZKLOGIN_SALT) {
-  console.error("❌ ZKLOGIN_SALT is missing from environment variables!");
   process.exit(1);
 }
 if (!process.env.GOOGLE_CLIENT_ID) {
@@ -57,42 +52,6 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * Endpoint to securely derive a zkLogin address using backend-only Salt (SEC-04)
- */
-app.post('/derive-address', async (req, res) => {
-  try {
-    const { jwt } = req.body;
-    if (!jwt || typeof jwt !== 'string') {
-      return res.status(400).json({ error: 'Missing or invalid jwt payload' });
-    }
-
-    const parts = jwt.split('.');
-    if (parts.length !== 3) {
-      return res.status(400).json({ error: 'Invalid JWT structure' });
-    }
-
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf-8'));
-    
-    // Validate JWT claims
-    if (payload.aud !== process.env.GOOGLE_CLIENT_ID) {
-      return res.status(400).json({ error: 'Invalid JWT audience' });
-    }
-    if (payload.iss !== 'https://accounts.google.com' && payload.iss !== 'accounts.google.com') {
-      return res.status(400).json({ error: 'Invalid JWT issuer' });
-    }
-    if (payload.exp < Date.now() / 1000) {
-      return res.status(400).json({ error: 'JWT has expired' });
-    }
-
-    const address = jwtToAddress(jwt, BigInt(process.env.ZKLOGIN_SALT!), false);
-    res.json({ address });
-  } catch (error: any) {
-    console.error('Derive address error:', error);
-    res.status(500).json({ error: error.message || 'Failed to derive address' });
-  }
-});
-
-/**
  * Endpoint to securely upload file to Walrus and auto-transfer ownership to the user/admin (SEC-05)
  */
 app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res) => {
@@ -116,19 +75,18 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
     let isAuthorized = false;
 
     if (authHeader && authHeader.startsWith('Bearer ')) {
-      // zkLogin verification via JWT
+      // zkLogin verification via Enoki
       const jwt = authHeader.substring(7);
       try {
-        const parts = jwt.split('.');
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf-8'));
-        if (
-          payload.aud === process.env.GOOGLE_CLIENT_ID &&
-          (payload.iss === 'https://accounts.google.com' || payload.iss === 'accounts.google.com') &&
-          payload.exp > Date.now() / 1000
-        ) {
-          const derivedAddress = jwtToAddress(jwt, BigInt(process.env.ZKLOGIN_SALT!), false);
-
-          if (normalizeSuiAddress(derivedAddress) === normalizeSuiAddress(targetAddress)) {
+        const enokiRes = await fetch('https://api.enoki.mystenlabs.com/v1/zklogin', {
+          headers: {
+            'Authorization': 'Bearer enoki_public_b1c00104f51636649e30132176038cd8',
+            'zklogin-jwt': jwt,
+          },
+        });
+        if (enokiRes.ok) {
+          const enokiData = (await enokiRes.json() as any).data;
+          if (normalizeSuiAddress(enokiData.address) === normalizeSuiAddress(targetAddress)) {
             isAuthorized = true;
           }
         }
@@ -346,30 +304,34 @@ app.post('/faucet', async (req, res) => {
       return res.status(400).json({ error: 'Missing or invalid recipient address' });
     }
 
-    console.log(`[Faucet] Minting MIPET tokens to ${recipient}...`);
+    const FAUCET_AMOUNT = 10000_000000000n; // 10,000 MIPET
+    const PET_TOKEN_TYPE = `${process.env.PET_TOKEN_PACKAGE_ID || '0x46af6cc67f8a40f6a4a5267087176e6e4341e51df6e9decabfe07cf606186e23'}::pet_token::PET_TOKEN`;
+
+    console.log(`[Faucet] Transferring MIPET tokens to ${recipient}...`);
 
     const tx = new Transaction();
-    tx.moveCall({
-      target: `${process.env.PET_TOKEN_PACKAGE_ID || '0x34564fd6bf0afdd7cbd6d2f2943de413df645ffa703417948638ea1d10c710d8'}::pet_token::mint`,
-      arguments: [
-        tx.object(process.env.TREASURY_CAP_ID || '0xee70cb5c91f06d64d2e136378008550b47fa29dc6057ed9538e97641bbdbe629'),
-        tx.pure.u64(10000_000000000n), // 10,000 MIPET (9 decimals)
-        tx.pure.address(recipient)
-      ]
-    });
+    tx.setSender(adminKeypair.getPublicKey().toSuiAddress());
+
+    // Get admin's MIPET coins
+    const coins = await client.getCoins({ owner: adminKeypair.getPublicKey().toSuiAddress(), coinType: PET_TOKEN_TYPE });
+    if (!coins.data.length) {
+      return res.status(500).json({ error: 'Admin wallet has no MIPET tokens' });
+    }
+
+    const [coin] = tx.splitCoins(tx.object(coins.data[0].coinObjectId), [FAUCET_AMOUNT]);
+    tx.transferObjects([coin], recipient);
 
     const result = await client.signAndExecuteTransaction({
       signer: adminKeypair,
       transaction: tx,
     });
 
-    // Wait for transaction to succeed
     await client.waitForTransaction({ digest: result.digest });
 
-    console.log(`[Faucet] Successfully minted to ${recipient}. Tx: ${result.digest}`);
+    console.log(`[Faucet] Successfully transferred to ${recipient}. Tx: ${result.digest}`);
     res.json({ success: true, digest: result.digest });
   } catch (error: any) {
-    console.error('[Faucet] Error minting token:', error);
+    console.error('[Faucet] Error:', error);
     res.status(500).json({ error: error.message || 'Faucet request failed' });
   }
 });
