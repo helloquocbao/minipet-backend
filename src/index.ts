@@ -5,7 +5,6 @@ import { Buffer } from 'buffer';
 import { getJsonRpcFullnodeUrl as getFullnodeUrl, SuiJsonRpcClient as SuiClient } from '@mysten/sui/jsonRpc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction } from '@mysten/sui/transactions';
-import { jwtToAddress } from '@mysten/sui/zklogin';
 
 dotenv.config();
 
@@ -16,10 +15,6 @@ if (!process.env.ADMIN_SECRET_KEY) {
 }
 if (!process.env.PACKAGE_ID) {
   console.error("❌ PACKAGE_ID is missing from environment variables!");
-  process.exit(1);
-}
-if (!process.env.ZKLOGIN_SALT) {
-  console.error("❌ ZKLOGIN_SALT is missing from environment variables!");
   process.exit(1);
 }
 if (!process.env.GOOGLE_CLIENT_ID) {
