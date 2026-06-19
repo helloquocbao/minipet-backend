@@ -52,42 +52,6 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * Endpoint to securely derive a zkLogin address using backend-only Salt (SEC-04)
- */
-app.post('/derive-address', async (req, res) => {
-  try {
-    const { jwt } = req.body;
-    if (!jwt || typeof jwt !== 'string') {
-      return res.status(400).json({ error: 'Missing or invalid jwt payload' });
-    }
-
-    const parts = jwt.split('.');
-    if (parts.length !== 3) {
-      return res.status(400).json({ error: 'Invalid JWT structure' });
-    }
-
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf-8'));
-    
-    // Validate JWT claims
-    if (payload.aud !== process.env.GOOGLE_CLIENT_ID) {
-      return res.status(400).json({ error: 'Invalid JWT audience' });
-    }
-    if (payload.iss !== 'https://accounts.google.com' && payload.iss !== 'accounts.google.com') {
-      return res.status(400).json({ error: 'Invalid JWT issuer' });
-    }
-    if (payload.exp < Date.now() / 1000) {
-      return res.status(400).json({ error: 'JWT has expired' });
-    }
-
-    const address = jwtToAddress(jwt, BigInt(process.env.ZKLOGIN_SALT!), false);
-    res.json({ address });
-  } catch (error: any) {
-    console.error('Derive address error:', error);
-    res.status(500).json({ error: error.message || 'Failed to derive address' });
-  }
-});
-
-/**
  * Endpoint to securely upload file to Walrus and auto-transfer ownership to the user/admin (SEC-05)
  */
 app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res) => {
