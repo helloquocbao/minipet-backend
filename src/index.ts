@@ -21,6 +21,10 @@ if (!process.env.GOOGLE_CLIENT_ID) {
   console.error("❌ GOOGLE_CLIENT_ID is missing from environment variables!");
   process.exit(1);
 }
+if (!process.env.ENOKI_API_KEY) {
+  console.error("❌ ENOKI_API_KEY is missing from environment variables!");
+  process.exit(1);
+}
 
 const app = express();
 app.use(cors());
@@ -80,7 +84,7 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
       try {
         const enokiRes = await fetch('https://api.enoki.mystenlabs.com/v1/zklogin', {
           headers: {
-            'Authorization': 'Bearer enoki_public_b1c00104f51636649e30132176038cd8',
+            'Authorization': `Bearer ${process.env.ENOKI_API_KEY}`,
             'zklogin-jwt': jwt,
           },
         });
