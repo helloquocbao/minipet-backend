@@ -21,6 +21,10 @@ if (!process.env.GOOGLE_CLIENT_ID) {
   console.error("❌ GOOGLE_CLIENT_ID is missing from environment variables!");
   process.exit(1);
 }
+if (!process.env.ENOKI_API_KEY) {
+  console.error("❌ ENOKI_API_KEY is missing from environment variables!");
+  process.exit(1);
+}
 
 const app = express();
 app.use(cors());
@@ -80,7 +84,7 @@ app.post('/upload', express.raw({ type: '*/*', limit: '10mb' }), async (req, res
       try {
         const enokiRes = await fetch('https://api.enoki.mystenlabs.com/v1/zklogin', {
           headers: {
-            'Authorization': 'Bearer enoki_public_b1c00104f51636649e30132176038cd8',
+            'Authorization': `Bearer ${process.env.ENOKI_API_KEY}`,
             'zklogin-jwt': jwt,
           },
         });
@@ -305,7 +309,7 @@ app.post('/faucet', async (req, res) => {
     }
 
     const FAUCET_AMOUNT = 10000_000000000n; // 10,000 MIPET
-    const PET_TOKEN_TYPE = `${process.env.PET_TOKEN_PACKAGE_ID || '0x46af6cc67f8a40f6a4a5267087176e6e4341e51df6e9decabfe07cf606186e23'}::pet_token::PET_TOKEN`;
+    const PET_TOKEN_TYPE = `${process.env.PET_TOKEN_PACKAGE_ID || '0x7762d89a5c01c00ae0d118e3a2f6191ef13aa701a5aa7f57ecc38fe6959c403e'}::pet_token::PET_TOKEN`;
 
     console.log(`[Faucet] Transferring MIPET tokens to ${recipient}...`);
 
