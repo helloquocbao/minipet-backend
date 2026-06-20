@@ -309,7 +309,7 @@ app.post('/faucet', async (req, res) => {
     }
 
     const FAUCET_AMOUNT = 10000_000000000n; // 10,000 MIPET
-    const PET_TOKEN_TYPE = `${process.env.PET_TOKEN_PACKAGE_ID || '0x46af6cc67f8a40f6a4a5267087176e6e4341e51df6e9decabfe07cf606186e23'}::pet_token::PET_TOKEN`;
+    const PET_TOKEN_TYPE = `${process.env.PET_TOKEN_PACKAGE_ID || '0x7762d89a5c01c00ae0d118e3a2f6191ef13aa701a5aa7f57ecc38fe6959c403e'}::pet_token::PET_TOKEN`;
 
     console.log(`[Faucet] Transferring MIPET tokens to ${recipient}...`);
 
